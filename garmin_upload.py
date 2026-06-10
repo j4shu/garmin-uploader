@@ -21,6 +21,7 @@ TrainerDay TCX filenames look like "2026-06-09 20-35-37 - 5x3 120%, 2x 102%.tcx"
 from __future__ import annotations
 
 import getpass
+import logging
 import os
 import re
 import sys
@@ -56,9 +57,33 @@ TYPE_CANDIDATES = ("virtual_ride", "virtual_cycling")
 
 # TrainerDay TCX export: "<date> <time> - <workout title>.tcx", e.g.
 # "2026-06-09 20-35-37 - 5x3 120%, 2x 102%.tcx" (optional "Downloaded " prefix).
-TRAINERDAY_TCX = re.compile(
+TRAINERDAY_TCX_FORMAT_REGEX = re.compile(
     r"^(?:Downloaded )?\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2} - (?P<title>.+)$"
 )
+
+# --- Logging ------------------------------------------------------------------
+log = logging.getLogger("garmin_upload")
+
+
+def setup_logging() -> None:
+    """Timestamped logging that mirrors the prior print/stderr split: progress
+    (INFO) goes to stdout, warnings and errors to stderr."""
+    log.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    stdout = logging.StreamHandler(sys.stdout)
+    stdout.setLevel(logging.INFO)
+    stdout.addFilter(lambda record: record.levelno < logging.WARNING)
+    stdout.setFormatter(fmt)
+
+    stderr = logging.StreamHandler(sys.stderr)
+    stderr.setLevel(logging.WARNING)
+    stderr.setFormatter(fmt)
+
+    log.addHandler(stdout)
+    log.addHandler(stderr)
 
 
 def find_latest_tcx(directory: Path) -> Path | None:
@@ -69,12 +94,12 @@ def find_latest_tcx(directory: Path) -> Path | None:
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
-def parse_trainerday_tcx(path: Path) -> str | None:
+def parse_activity_name(path: Path) -> str | None:
     """Return the workout title from a TrainerDay TCX filename, or None if the
     name doesn't match the TrainerDay pattern."""
     if path.suffix.lower() != ".tcx":
         return None
-    m = TRAINERDAY_TCX.match(path.stem)
+    m = TRAINERDAY_TCX_FORMAT_REGEX.match(path.stem)
     if not m:
         return None
     return m.group("title").strip() or DEFAULT_NAME
@@ -93,7 +118,7 @@ def extract_activity_id(import_result) -> str | None:
     return None
 
 
-def read_tcx_start_time(path: Path) -> datetime | None:
+def parse_start_time(path: Path) -> datetime | None:
     """Read the activity start time (naive UTC) from the TCX, or None.
 
     The TCX <Id> element is the activity start in ISO-8601 UTC. This is the
@@ -103,7 +128,7 @@ def read_tcx_start_time(path: Path) -> datetime | None:
     try:
         text = path.read_text(errors="ignore")
     except OSError as exc:
-        print(f"  ! could not read TCX ({exc})")
+        log.warning(f"could not read TCX ({exc}")
         return None
     m = re.search(r"<Id>([^<]+)</Id>", text)
     if not m:
@@ -114,7 +139,7 @@ def read_tcx_start_time(path: Path) -> datetime | None:
             return datetime.strptime(stamp, fmt)
         except ValueError:
             continue
-    print(f"  ! could not parse TCX start time {stamp!r}")
+    log.warning(f"could not parse TCX start time {stamp!r}")
     return None
 
 
@@ -123,7 +148,7 @@ def recent_activity_ids(client) -> set[str]:
     try:
         acts = client.get_activities(0, 20)
     except Exception as exc:  # noqa: BLE001
-        print(f"    (could not list recent activities: {exc})")
+        log.warning(f"could not list recent activities: {exc}")
         return set()
     items = acts.get("activityList") if isinstance(acts, dict) else acts
     return {
@@ -166,7 +191,7 @@ def wait_for_activity(
         try:
             acts = client.get_activities(0, 20)
         except Exception as exc:  # noqa: BLE001
-            print(f"    (could not list recent activities: {exc})")
+            log.warning(f"could not list recent activities: {exc}")
             acts = None
         items = (acts.get("activityList") if isinstance(acts, dict) else acts) or []
 
@@ -181,7 +206,7 @@ def wait_for_activity(
 
         if waited >= timeout_s:
             return None
-        print(f"    waiting for the uploaded activity to appear... ({waited}s)")
+        log.info(f"waiting for the uploaded activity to appear... ({waited}s")
         time.sleep(interval_s)
         waited += interval_s
 
@@ -192,7 +217,7 @@ def resolve_type(client) -> tuple[int, str, int] | None:
     try:
         catalog = client.get_activity_types()
     except Exception as exc:  # noqa: BLE001
-        print(f"  ! could not fetch activity types ({exc}); leaving type unchanged")
+        log.warning(f"could not fetch activity types ({exc}); leaving type unchanged")
         return None
     index = {t["typeKey"]: t for t in (catalog or []) if t.get("typeKey")}
     for key in TYPE_CANDIDATES:
@@ -212,8 +237,8 @@ def _print_relevant_types(client) -> None:
     relevant = [
         k for k in keys if any(w in k for w in ("cycl", "ride", "virtual", "bik"))
     ]
-    print(
-        f"    cycling-related type keys in your catalog: {', '.join(relevant) or '(none)'}"
+    log.warning(
+        f"cycling-related type keys in your catalog: {', '.join(relevant) or '(none)'}"
     )
 
 
@@ -222,7 +247,7 @@ def get_activity_summary(client, activity_id) -> tuple[str | None, str | None]:
     try:
         act = client.get_activity(activity_id)
     except Exception as exc:  # noqa: BLE001
-        print(f"    (could not read activity {activity_id} back: {exc})")
+        log.warning(f"could not read activity {activity_id} back: {exc}")
         return None, None
     if not isinstance(act, dict):
         return None, None
@@ -240,16 +265,15 @@ def apply_edits(client, activity_id, name: str, settle: bool = True) -> bool:
     """
     resolved = resolve_type(client)
     if resolved is None:
-        print(
-            "  ! no Virtual Cycling type in your catalog (tried "
-            f"{', '.join(TYPE_CANDIDATES)}); will set the name only.",
-            file=sys.stderr,
+        log.warning(
+            "no Virtual Cycling type in your catalog (tried "
+            f"{', '.join(TYPE_CANDIDATES)}); will set the name only."
         )
         _print_relevant_types(client)
     target_type = resolved[1] if resolved else None
 
     if settle:
-        print(f"  waiting {SETTLE_SECONDS}s for Garmin to finish processing...")
+        log.info(f"waiting {SETTLE_SECONDS}s for Garmin to finish processing...")
         time.sleep(SETTLE_SECONDS)
 
     for attempt in range(1, 4):
@@ -259,18 +283,18 @@ def apply_edits(client, activity_id, name: str, settle: bool = True) -> bool:
 
         time.sleep(3)  # let the edit register
         cur_name, cur_type = get_activity_summary(client, activity_id)
-        print(
-            f"  attempt {attempt}: Garmin now has name={cur_name!r}, type={cur_type!r}"
+        log.info(
+            f"attempt {attempt}: Garmin now has name={cur_name!r}, type={cur_type!r}"
         )
 
         name_ok = cur_name == name
         type_ok = target_type is None or cur_type == target_type
         if name_ok and type_ok:
-            print("  verified on Garmin.")
+            log.info("verified on Garmin.")
             return True
         time.sleep(4)  # wait for any late processing, then re-apply
 
-    print("  ! edits did not stick after retries.", file=sys.stderr)
+    log.error("edits did not stick after retries.")
     return False
 
 
@@ -282,7 +306,7 @@ def login() -> Garmin:
             client.login(str(TOKENSTORE))
             return client
         except Exception as exc:  # noqa: BLE001
-            print(f"  cached session unusable ({exc}); logging in fresh")
+            log.warning(f"cached session unusable ({exc}); logging in fresh")
     email = os.getenv("GARMIN_EMAIL") or input("Garmin email: ").strip()
     password = os.getenv("GARMIN_PASSWORD") or getpass.getpass("Garmin password: ")
     client = Garmin(
@@ -295,33 +319,34 @@ def login() -> Garmin:
 
 
 def main() -> int:
+    setup_logging()
     load_dotenv()
     dry_run = "--dry-run" in sys.argv
 
     latest = find_latest_tcx(TRAINERDAY_DIR)
     if latest is None:
-        print(f"No .tcx files found under {TRAINERDAY_DIR}")
+        log.info(f"No .tcx files found under {TRAINERDAY_DIR}")
         return 0
-    print(f"Latest file: {latest.name}")
+    log.info(f"Latest file: {latest.name}")
 
-    name = parse_trainerday_tcx(latest)
+    name = parse_activity_name(latest)
     if name is None:
-        print("  not a TrainerDay activity (filename pattern didn't match); skipping.")
+        log.info("not a TrainerDay activity (filename pattern didn't match); skipping.")
         return 0
-    start = read_tcx_start_time(latest)
-    print(f"  parsed -> name={name!r}, start(UTC)={start}, type=virtual cycling")
+    start = parse_start_time(latest)
+    log.info(f"parsed -> name={name!r}, start(UTC)={start}, type=virtual cycling")
 
     if dry_run:
-        print("  (dry run: not logging in or uploading)")
+        log.info("dry run: not logging in or uploading")
         return 0
 
     try:
         client = login()
     except GarminConnectTooManyRequestsError:
-        print("Garmin rate-limited the login; wait a few minutes.", file=sys.stderr)
+        log.error("Garmin rate-limited the login; wait a few minutes.")
         return 2
     except GarminConnectAuthenticationError as exc:
-        print(f"Login failed: {exc}", file=sys.stderr)
+        log.error(f"Login failed: {exc}")
         return 2
 
     # Snapshot existing activities so we can recognise the newly-created one and
@@ -335,27 +360,26 @@ def main() -> int:
         detail = (
             result.get("detailedImportResult", {}) if isinstance(result, dict) else {}
         )
-        print(
-            f"  upload result: successes={detail.get('successes')} failures={detail.get('failures')}"
+        log.info(
+            f"upload result: successes={detail.get('successes')} failures={detail.get('failures')}"
         )
         id_from_result = extract_activity_id(result)  # precise id when present
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         msg = str(exc).lower()
         if "duplicate" in msg or "already exist" in msg:
-            print("  already on Garmin (duplicate) -- locating it by start time...")
+            log.info("already on Garmin (duplicate) -- locating it by start time...")
             duplicate = True
         else:
-            print(f"Upload failed: {exc}", file=sys.stderr)
+            log.error(f"Upload failed: {exc}")
             return 1
 
     activity_id = id_from_result
     if activity_id is None:
         if start is None and duplicate:
             # No id, can't match by time, nothing new to detect: don't guess.
-            print(
+            log.error(
                 "Cannot identify the existing activity (no TCX start time); "
-                "refusing to edit to avoid touching the wrong one.",
-                file=sys.stderr,
+                "refusing to edit to avoid touching the wrong one."
             )
             return 1
         activity_id = wait_for_activity(
@@ -363,20 +387,19 @@ def main() -> int:
         )
 
     if activity_id is None:
-        print(
+        log.error(
             "Could not confidently identify the uploaded activity; edited nothing. "
-            "Check Garmin Connect and re-run.",
-            file=sys.stderr,
+            "Check Garmin Connect and re-run."
         )
         return 1
-    print(f"  editing activity {activity_id}")
+    log.info(f"editing activity {activity_id}")
 
     # Only settle when Garmin handed us an id synchronously (the activity may
     # still be processing). If we found it by polling or it's a duplicate, it's
     # already indexed, so skip the wait — the verify-and-retry loop covers edge
     # cases either way.
     ok = apply_edits(client, activity_id, name, settle=id_from_result is not None)
-    print("Done." if ok else "Finished with problems (see above).")
+    log.info("Done." if ok else "Finished with problems (see above).")
     return 0 if ok else 1
 
 

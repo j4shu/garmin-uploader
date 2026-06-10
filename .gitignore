@@ -10,3 +10,6 @@ garmin_tokens.json
 __pycache__/
 *.py[cod]
 .venv/
+
+# Claude
+.claude/
