@@ -4,11 +4,12 @@ Finds the most recent .tcx that TrainerDay exported into the Dropbox app folder,
 uploads it to Garmin, then sets the activity name (the workout title from the
 filename) and type (Virtual Cycling). Name and type can only be set after upload
 (Garmin auto-names imports and TCX can't express a virtual sport), so the script
-identifies the uploaded activity by its exact start time to edit the right one.
+identifies the uploaded activity as the new most-recent activity to edit the
+right one.
 
 Usage:
-    uv run garmin_upload.py            # find, upload + edit
     uv run garmin_upload.py --dry-run  # find + parse only; no login, no upload
+    uv run garmin_upload.py            # find, upload + edit
 
 Auth: the first run prompts for your Garmin email/password (+ MFA code); the
 token is cached in ~/.garminconnect and reused afterwards. To skip the prompts,
@@ -26,34 +27,14 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from garminconnect import (
-    Garmin,
-    GarminConnectAuthenticationError,
-    GarminConnectTooManyRequestsError,
-)
+from garminconnect import Garmin
 
 # --- Configuration -----------------------------------------------------------
 TRAINERDAY_DIR = Path("~/Library/CloudStorage/Dropbox/Apps/TrainerDay").expanduser()
 TOKENSTORE = Path("~/.garminconnect").expanduser()
-
-# Used as the activity name only if the title can't be parsed from the filename.
-DEFAULT_NAME = "Virtual Cycling"
-
-# Garmin ingests an upload asynchronously and derives the sport from the file
-# plus an auto-name. If we edit too early those edits get overwritten, so wait
-# this long before editing, then verify against Garmin and retry.
-SETTLE_SECONDS = 8
-
-# Garmin type key(s) for "Virtual Cycling". The whole point is to convert the
-# ride to virtual, so only *virtual* keys belong here — never fall back to a
-# non-virtual type. Garmin labels "virtual_ride" as "Virtual Cycling" (the key
-# Zwift indoor rides sync as); "virtual_cycling" is accepted as a synonym in
-# case your catalog uses that spelling. First one present in your catalog wins.
-TYPE_CANDIDATES = ("virtual_ride", "virtual_cycling")
 
 # TrainerDay TCX export: "<date> <time> - <workout title>.tcx", e.g.
 # "2026-06-09 20-35-37 - 5x3 120%, 2x 102%.tcx" (optional "Downloaded " prefix).
@@ -61,11 +42,19 @@ TRAINERDAY_TCX_FORMAT_REGEX = re.compile(
     r"^(?:Downloaded )?\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2} - (?P<title>.+)$"
 )
 
+# Desired activity type
+# Note: payload is from `client.get_activity_types()`
+ACTIVITY_TYPE_DTO = {
+    "typeId": 152,
+    "typeKey": "virtual_ride",
+    "parentTypeId": 2,
+}
+
 # --- Logging ------------------------------------------------------------------
 log = logging.getLogger("garmin_upload")
 
 
-def setup_logging() -> None:
+def setup_logging():
     """Timestamped logging that mirrors the prior print/stderr split: progress
     (INFO) goes to stdout, warnings and errors to stderr."""
     log.setLevel(logging.INFO)
@@ -86,226 +75,62 @@ def setup_logging() -> None:
     log.addHandler(stderr)
 
 
-def find_latest_tcx(directory: Path) -> Path | None:
+def find_latest_tcx_file(directory: Path) -> Path | None:
     """Most recently modified .tcx under `directory` (recursive), or None."""
-    if not directory.exists():
-        return None
     files = [p for p in directory.rglob("*.tcx") if p.is_file()]
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
-def parse_activity_name(path: Path) -> str | None:
-    """Return the workout title from a TrainerDay TCX filename, or None if the
-    name doesn't match the TrainerDay pattern."""
-    if path.suffix.lower() != ".tcx":
-        return None
+def parse_activity_name(path: Path) -> str:
+    """Return the workout title from a TrainerDay TCX filename."""
     m = TRAINERDAY_TCX_FORMAT_REGEX.match(path.stem)
-    if not m:
-        return None
-    return m.group("title").strip() or DEFAULT_NAME
+    return m.group("title").strip()
 
 
-def extract_activity_id(import_result) -> str | None:
-    """Pull the new activity id out of an import_activity() result."""
-    if not isinstance(import_result, dict):
-        return None
-    detail = import_result.get("detailedImportResult", import_result)
-    if not isinstance(detail, dict):
-        return None
-    for entry in detail.get("successes") or []:
-        if entry.get("internalId") is not None:
-            return str(entry["internalId"])
-    return None
+def wait_for_activity_upload(
+    client: Garmin,
+    current_last_activity: dict | None,
+    timeout: int = 90,
+    poll_interval: int = 5,
+) -> dict:
+    """Return the just-uploaded activity, identified as the new most-recent
+    activity once Garmin finishes indexing it.
 
-
-def parse_start_time(path: Path) -> datetime | None:
-    """Read the activity start time (naive UTC) from the TCX, or None.
-
-    The TCX <Id> element is the activity start in ISO-8601 UTC. This is the
-    precise key we match Garmin activities against, so we never edit the wrong
-    activity.
+    Detects it by the most-recent activity changing from `current_last_activity`
+    (the last activity before the upload). Polls because Garmin indexes the
+    upload asynchronously, and raises TimeoutError if nothing new appears.
     """
-    try:
-        text = path.read_text(errors="ignore")
-    except OSError as exc:
-        log.warning(f"could not read TCX ({exc}")
-        return None
-    m = re.search(r"<Id>([^<]+)</Id>", text)
-    if not m:
-        return None
-    stamp = m.group(1).strip().replace("Z", "")  # trailing Z just marks UTC
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(stamp, fmt)
-        except ValueError:
-            continue
-    log.warning(f"could not parse TCX start time {stamp!r}")
-    return None
-
-
-def recent_activity_ids(client) -> set[str]:
-    """IDs of recent activities currently on Garmin (for new-activity detection)."""
-    try:
-        acts = client.get_activities(0, 20)
-    except Exception as exc:  # noqa: BLE001
-        log.warning(f"could not list recent activities: {exc}")
-        return set()
-    items = acts.get("activityList") if isinstance(acts, dict) else acts
-    return {
-        str(a["activityId"]) for a in (items or []) if a.get("activityId") is not None
-    }
-
-
-def _matches_start(
-    activity: dict, start: datetime | None, tolerance_s: int = 90
-) -> bool:
-    if start is None:
-        return False
-    stamp = activity.get("startTimeGMT")
-    if not stamp:
-        return False
-    try:
-        adt = datetime.strptime(stamp[:19], "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return False
-    return abs((adt - start).total_seconds()) <= tolerance_s
-
-
-def wait_for_activity(
-    client,
-    start: datetime | None,
-    before_ids: set[str],
-    allow_new: bool,
-    timeout_s: int = 90,
-    interval_s: int = 5,
-) -> str | None:
-    """Return the id of the just-uploaded activity, or None if it can't be
-    confidently identified (in which case the caller must NOT edit anything).
-
-    Identifies it by exact start-time match (works for fresh and duplicate) or,
-    for a fresh upload, by an id that wasn't present before (`allow_new`).
-    Polls because Garmin indexes the upload asynchronously.
-    """
+    current_last_activity_id = current_last_activity.get("activityId")
     waited = 0
     while True:
-        try:
-            acts = client.get_activities(0, 20)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(f"could not list recent activities: {exc}")
-            acts = None
-        items = (acts.get("activityList") if isinstance(acts, dict) else acts) or []
+        new_last_activity = client.get_last_activity()
+        new_last_activity_id = new_last_activity.get("activityId")
 
-        for a in items:  # precise: exact start-time match
-            if _matches_start(a, start) and a.get("activityId") is not None:
-                return str(a["activityId"])
-        if allow_new:  # fresh upload: an id that wasn't there before
-            for a in items:
-                aid = a.get("activityId")
-                if aid is not None and str(aid) not in before_ids:
-                    return str(aid)
+        if new_last_activity_id is not None:
+            # If the last activity changed, that means the upload was processed and is now the new last activity
+            if new_last_activity_id != current_last_activity_id:
+                log.info(f"Found new uploaded activity: {new_last_activity_id}")
+                return new_last_activity
 
-        if waited >= timeout_s:
-            return None
-        log.info(f"waiting for the uploaded activity to appear... ({waited}s")
-        time.sleep(interval_s)
-        waited += interval_s
-
-
-def resolve_type(client) -> tuple[int, str, int] | None:
-    """Resolve a virtual-cycling (type_id, type_key, parent_type_id) from the
-    live catalog, or None if none of the candidates exist."""
-    try:
-        catalog = client.get_activity_types()
-    except Exception as exc:  # noqa: BLE001
-        log.warning(f"could not fetch activity types ({exc}); leaving type unchanged")
-        return None
-    index = {t["typeKey"]: t for t in (catalog or []) if t.get("typeKey")}
-    for key in TYPE_CANDIDATES:
-        t = index.get(key)
-        if t:
-            return int(t["typeId"]), key, int(t["parentTypeId"])
-    return None
-
-
-def _print_relevant_types(client) -> None:
-    """Diagnostic: list the cycling/virtual type keys actually in the catalog."""
-    try:
-        catalog = client.get_activity_types()
-    except Exception:  # noqa: BLE001
-        return
-    keys = sorted(t.get("typeKey", "") for t in (catalog or []))
-    relevant = [
-        k for k in keys if any(w in k for w in ("cycl", "ride", "virtual", "bik"))
-    ]
-    log.warning(
-        f"cycling-related type keys in your catalog: {', '.join(relevant) or '(none)'}"
-    )
-
-
-def get_activity_summary(client, activity_id) -> tuple[str | None, str | None]:
-    """Read back (activityName, activityType typeKey) currently on Garmin."""
-    try:
-        act = client.get_activity(activity_id)
-    except Exception as exc:  # noqa: BLE001
-        log.warning(f"could not read activity {activity_id} back: {exc}")
-        return None, None
-    if not isinstance(act, dict):
-        return None, None
-    type_key = (act.get("activityTypeDTO") or {}).get("typeKey")
-    return act.get("activityName"), type_key
-
-
-def apply_edits(client, activity_id, name: str, settle: bool = True) -> bool:
-    """Set name + type, then verify they actually stuck, retrying a few times.
-
-    Garmin can overwrite edits made before it finishes processing the upload, so
-    we wait first, then apply, then read the activity back and re-apply until it
-    matches (or we give up loudly). `settle=False` skips the initial wait when
-    the activity is already processed (e.g. fixing an existing one).
-    """
-    resolved = resolve_type(client)
-    if resolved is None:
-        log.warning(
-            "no Virtual Cycling type in your catalog (tried "
-            f"{', '.join(TYPE_CANDIDATES)}); will set the name only."
-        )
-        _print_relevant_types(client)
-    target_type = resolved[1] if resolved else None
-
-    if settle:
-        log.info(f"waiting {SETTLE_SECONDS}s for Garmin to finish processing...")
-        time.sleep(SETTLE_SECONDS)
-
-    for attempt in range(1, 4):
-        client.set_activity_name(activity_id, name)
-        if resolved:
-            client.set_activity_type(activity_id, *resolved)
-
-        time.sleep(3)  # let the edit register
-        cur_name, cur_type = get_activity_summary(client, activity_id)
+        if waited >= timeout:
+            raise TimeoutError(
+                f"Waited {waited}s but no new activity appeared after upload; giving up."
+            )
         log.info(
-            f"attempt {attempt}: Garmin now has name={cur_name!r}, type={cur_type!r}"
+            f"Waiting for a new uploaded activity to appear. Waiting {poll_interval}s..."
         )
-
-        name_ok = cur_name == name
-        type_ok = target_type is None or cur_type == target_type
-        if name_ok and type_ok:
-            log.info("verified on Garmin.")
-            return True
-        time.sleep(4)  # wait for any late processing, then re-apply
-
-    log.error("edits did not stick after retries.")
-    return False
+        time.sleep(poll_interval)
+        waited += poll_interval
 
 
-def login() -> Garmin:
+def garmin_login() -> Garmin:
     """Restore a cached Garmin session, or log in fresh (with MFA) and cache it."""
     if TOKENSTORE.exists():
         try:
             client = Garmin()
             client.login(str(TOKENSTORE))
             return client
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.warning(f"cached session unusable ({exc}); logging in fresh")
     email = os.getenv("GARMIN_EMAIL") or input("Garmin email: ").strip()
     password = os.getenv("GARMIN_PASSWORD") or getpass.getpass("Garmin password: ")
@@ -318,89 +143,63 @@ def login() -> Garmin:
     return client
 
 
-def main() -> int:
+def main():
     setup_logging()
     load_dotenv()
     dry_run = "--dry-run" in sys.argv
 
-    latest = find_latest_tcx(TRAINERDAY_DIR)
-    if latest is None:
-        log.info(f"No .tcx files found under {TRAINERDAY_DIR}")
+    # Find the latest TCX file exported by TrainerDay
+    tcx_file = find_latest_tcx_file(TRAINERDAY_DIR)
+    if tcx_file is None:
+        log.warning(f"No .tcx files found under: {TRAINERDAY_DIR}")
         return 0
-    log.info(f"Latest file: {latest.name}")
+    log.info(f"Found latest tcx file: {tcx_file.name}")
+    log.info(f"Full path: {tcx_file.resolve()}")
 
-    name = parse_activity_name(latest)
-    if name is None:
-        log.info("not a TrainerDay activity (filename pattern didn't match); skipping.")
-        return 0
-    start = parse_start_time(latest)
-    log.info(f"parsed -> name={name!r}, start(UTC)={start}, type=virtual cycling")
+    # Parse the activity name
+    activity_name = parse_activity_name(tcx_file)
+    log.info(f"Parsed activity name: {activity_name}")
 
+    # Return early if dry run
     if dry_run:
-        log.info("dry run: not logging in or uploading")
+        log.warning("DRY RUN: No upload or edits will be performed.")
         return 0
 
-    try:
-        client = login()
-    except GarminConnectTooManyRequestsError:
-        log.error("Garmin rate-limited the login; wait a few minutes.")
-        return 2
-    except GarminConnectAuthenticationError as exc:
-        log.error(f"Login failed: {exc}")
-        return 2
+    # Garmin login
+    client = garmin_login()
 
-    # Snapshot existing activities so we can recognise the newly-created one and
-    # never touch a pre-existing activity.
-    before_ids = recent_activity_ids(client)
+    # Save the current last activity before upload so we can recognise the newly-created one
+    # and never touch a pre-existing activity.
+    current_last_activity = client.get_last_activity()
 
-    duplicate = False
-    id_from_result = None
-    try:
-        result = client.import_activity(str(latest))
-        detail = (
-            result.get("detailedImportResult", {}) if isinstance(result, dict) else {}
-        )
-        log.info(
-            f"upload result: successes={detail.get('successes')} failures={detail.get('failures')}"
-        )
-        id_from_result = extract_activity_id(result)  # precise id when present
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "duplicate" in msg or "already exist" in msg:
-            log.info("already on Garmin (duplicate) -- locating it by start time...")
-            duplicate = True
-        else:
-            log.error(f"Upload failed: {exc}")
-            return 1
+    # Upload the new activity
+    result = client.import_activity(str(tcx_file))
+    log.info(f"Garmin upload initiated. Result: {result}")
 
-    activity_id = id_from_result
-    if activity_id is None:
-        if start is None and duplicate:
-            # No id, can't match by time, nothing new to detect: don't guess.
-            log.error(
-                "Cannot identify the existing activity (no TCX start time); "
-                "refusing to edit to avoid touching the wrong one."
-            )
-            return 1
-        activity_id = wait_for_activity(
-            client, start, before_ids, allow_new=not duplicate
-        )
+    # Wait for it to appear
+    uploaded_activity = wait_for_activity_upload(client, current_last_activity)
+    uploaded_activity_id = uploaded_activity.get("activityId")
+    # log.info(f"Uploaded activity before edits: {uploaded_activity}")
 
-    if activity_id is None:
-        log.error(
-            "Could not confidently identify the uploaded activity; edited nothing. "
-            "Check Garmin Connect and re-run."
-        )
-        return 1
-    log.info(f"editing activity {activity_id}")
+    # Sleep to let Garmin activity processing to settle before editing
+    time.sleep(3)
 
-    # Only settle when Garmin handed us an id synchronously (the activity may
-    # still be processing). If we found it by polling or it's a duplicate, it's
-    # already indexed, so skip the wait — the verify-and-retry loop covers edge
-    # cases either way.
-    ok = apply_edits(client, activity_id, name, settle=id_from_result is not None)
-    log.info("Done." if ok else "Finished with problems (see above).")
-    return 0 if ok else 1
+    # Edit it and finish
+    activity_type = ACTIVITY_TYPE_DTO["typeKey"]
+    log.info(f"Editing activity name to: {activity_name}")
+    client.set_activity_name(uploaded_activity_id, activity_name)
+    log.info(f"Editing activity type to: {activity_type}")
+    client.set_activity_type(uploaded_activity_id, *ACTIVITY_TYPE_DTO.values())
+
+    # Verify the edits stuck
+    log.info("Verifying activity after edits...")
+    verify_activity = client.get_activity(uploaded_activity_id)
+    # log.info(f"Verifying activity after edits: {verify_activity}")
+    assert verify_activity.get("activityName") == activity_name
+    assert verify_activity.get("activityTypeDTO").get("typeKey") == activity_type
+
+    log.info("Done.")
+    return 0
 
 
 if __name__ == "__main__":
