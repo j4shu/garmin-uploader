@@ -1,0 +1,12 @@
+# Secrets
+.env
+
+# Garmin OAuth tokens (default store is ~/.garminconnect, outside the repo;
+# ignore any local copies)
+.garminconnect/
+garmin_tokens.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
