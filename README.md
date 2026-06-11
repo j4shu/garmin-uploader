@@ -18,32 +18,21 @@ Intervals.icu.
 
 ## How It Works
 
-This script simply automates the manual process above. When you run it, it finds
-the most recent `.tcx` file in your TrainerDay Dropbox folder, parses the
-workout title from the filename, uploads it to Garmin Connect, and then edits
-the activity to set the correct name and type.
+This script simply automates the manual process above. When you run it, it:
+
+1. Prompts you to log in to Garmin. The credentials are cached at
+   `~/.garminconnect` for future runs.
+2. Finds the most recent `.tcx` file in your TrainerDay Dropbox folder.
+   - Defaults to `~/Library/CloudStorage/Dropbox/Apps/TrainerDay`.
+3. Parses the workout title from the filename.
+   - For example, `2026-06-09 20-35-37 - Z2 60%.tcx` becomes `Z2 60%`.
+4. Uploads it to Garmin Connect.
+5. Edits the activity's type and name.
 
 Editing activity fields can only happen after the initial upload. The script
-handles this by snapshotting your most recent activity before uploading and
-using that to detect when the new activity appears after upload. A pre-existing
+handles this by snapshotting your most recent activity before upload and then
+uses that to detect when the new activity appears after upload. A pre-existing
 activity is never touched.
-
-The script reads `.tcx` files from `TRAINERDAY_DIR` by default:
-
-```
-~/Library/CloudStorage/Dropbox/Apps/TrainerDay
-```
-
-TrainerDay names its files `<date> <time> - <workout title>.tcx`, for example:
-
-```
-2026-06-09 20-35-37 - 5x3 120%, 2x 102%.tcx
-```
-
-After the script finishes, `5x3 120%, 2x 102%` becomes the activity name.
-
-On the very first run, you're prompted to log in to Garmin. The credentials are
-cached at `TOKENSTORE` (defaults to `~/.garminconnect`) for future runs.
 
 ## Requirements
 
@@ -54,7 +43,7 @@ cached at `TOKENSTORE` (defaults to `~/.garminconnect`) for future runs.
 
 ## Setup
 
-Install dependencies into a virtual environment:
+Install dependencies:
 
 ```
 uv sync
