@@ -1,6 +1,3 @@
-# Secrets
-.env
-
 # Garmin OAuth tokens (default store is ~/.garminconnect, outside the repo;
 # ignore any local copies)
 .garminconnect/

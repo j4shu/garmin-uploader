@@ -1,34 +1,12 @@
-"""Upload the latest TrainerDay workout to Garmin Connect as Virtual Cycling.
-
-Finds the most recent .tcx that TrainerDay exported into the Dropbox app folder,
-uploads it to Garmin, then sets the activity name (the workout title from the
-filename) and type (Virtual Cycling). Name and type can only be set after upload
-(Garmin auto-names imports and TCX can't express a virtual sport), so the script
-identifies the uploaded activity as the new most-recent activity to edit the
-right one.
-
-Usage:
-    uv run garmin_upload.py --dry-run  # find + parse only; no login, no upload
-    uv run garmin_upload.py            # find, upload + edit
-
-Auth: the first run prompts for your Garmin email/password (+ MFA code); the
-token is cached in ~/.garminconnect and reused afterwards.
-
-TrainerDay TCX filenames look like "<date> <time> - <workout title>". The workout
-title is used as the activity name.
-"""
-
 from __future__ import annotations
 
 import getpass
 import logging
-import os
 import re
 import sys
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
 from garminconnect import Garmin
 
 TRAINERDAY_DIR = Path("~/Library/CloudStorage/Dropbox/Apps/TrainerDay").expanduser()
@@ -59,6 +37,7 @@ def setup_logging():
 
 
 def find_latest_tcx_file(directory: Path) -> Path:
+    """Return the most recently modified .tcx file in the given directory."""
     files = [p for p in directory.glob("*.tcx") if p.is_file()]
     if not files:
         raise FileNotFoundError(f"No .tcx files found in: {directory}")
@@ -93,30 +72,45 @@ def wait_for_activity_upload(
         time.sleep(poll_interval)
 
 
-def garmin_login() -> Garmin:
-    """Restore a cached Garmin session, or log in fresh (with MFA) and cache it."""
-    if TOKENSTORE.exists():
-        try:
-            client = Garmin()
-            client.login(str(TOKENSTORE))
-            return client
-        except Exception as exc:
-            log.warning(f"cached session unusable ({exc}); logging in fresh")
-    email = os.getenv("GARMIN_EMAIL") or input("Garmin email: ").strip()
-    password = os.getenv("GARMIN_PASSWORD") or getpass.getpass("Garmin password: ")
+def garmin_interactive_login() -> Garmin:
+    """Prompt for credentials (+ MFA) and cache a fresh OAuth token to TOKENSTORE."""
+    email = input("Garmin Connect email: ").strip()
+    password = getpass.getpass("Garmin Connect password: ")
     client = Garmin(
         email=email,
         password=password,
-        prompt_mfa=lambda: input("MFA / 2FA code: ").strip(),
+        prompt_mfa=lambda: input("MFA/2FA code: ").strip(),
     )
     client.login(str(TOKENSTORE))  # caches tokens to TOKENSTORE
+    log.info(f"Sucessfully logged in. Garmin session cached: {TOKENSTORE}")
     return client
+
+
+def garmin_login() -> Garmin:
+    """Return an authenticated Garmin client, logging in at the start of a run.
+
+    Reuses the cached session at TOKENSTORE when present and still valid
+    (refreshing a near-expiry token); otherwise prompts for credentials and
+    caches a fresh session.
+    """
+    if TOKENSTORE.exists():
+        try:
+            client = Garmin()
+            client.login(str(TOKENSTORE))  # validates + refreshes if near expiry
+            log.info(f"Found cached Garmin session: {TOKENSTORE}.")
+            return client
+        except Exception as exc:
+            log.warning(f"Cached session unusable: ({exc}); logging in fresh.")
+    return garmin_interactive_login()
 
 
 def main():
     setup_logging()
-    load_dotenv()
+
     dry_run = "--dry-run" in sys.argv
+
+    # Log in to Garmin up front, before touching any files.
+    client = garmin_login()
 
     # Find the latest TCX file exported by TrainerDay
     tcx_file = find_latest_tcx_file(TRAINERDAY_DIR)
@@ -131,9 +125,6 @@ def main():
     if dry_run:
         log.warning("DRY RUN: No upload or edits will be performed.")
         return 0
-
-    # Garmin login
-    client = garmin_login()
 
     # Save the current last activity before upload so we can recognise the newly-created one
     # and never touch a pre-existing activity.
