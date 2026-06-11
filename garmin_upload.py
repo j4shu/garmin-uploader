@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import getpass
 import logging
 import re
