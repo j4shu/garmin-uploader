@@ -175,7 +175,7 @@ wheels = [
 ]
 
 [[package]]
-name = "garmin-uploader"
+name = "trainerday-to-garmin"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

@@ -22,7 +22,7 @@ ACTIVITY_TYPE_DTO = {
     "typeKey": "virtual_ride",
     "parentTypeId": 2,
 }
-log = logging.getLogger("garmin_upload")
+log = logging.getLogger("main")
 
 
 def setup_logging():

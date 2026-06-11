@@ -1,4 +1,4 @@
-# garmin-uploader
+# TrainerDay to Garmin Connect
 
 Automatically uploads the latest [TrainerDay](https://trainerday.com/) indoor
 cycling workout to [Garmin Connect](https://connect.garmin.com/).
@@ -55,11 +55,11 @@ Dry run: Log in to Garmin, then find the latest `.tcx` only (no upload or
 edits).
 
 ```
-uv run garmin_upload.py --dry-run
+uv run main.py --dry-run
 ```
 
 Same as above, but continue to perform the upload and edits:
 
 ```
-uv run garmin_upload.py
+uv run main.py
 ```
